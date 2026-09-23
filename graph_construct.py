@@ -46,7 +46,10 @@ atom_pair = ['A_A', 'A_C', 'A_OA', 'A_N', 'A_NA', 'A_SA', 'A_HD',
 
 bin_number = 10
 type_number = len(atom_pair)
-inter_distance = 15
+# M0 FIX (was 15). Bin width is inter_distance/bin_number, so at 15 A each bin
+# spans 1.5 A and at 6 A it spans 0.6 A -- the same 280-d edge vector encodes
+# different physical distances. Must match the cutoff in pdb2graph.py.
+inter_distance = 6
 y_dict = read_y('data/PPIdataindex.txt')
 
 

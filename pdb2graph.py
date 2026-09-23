@@ -459,7 +459,11 @@ def get_edge_index(inter_pairs, len_protein1_fasta):
 
 
 aminoacid_abbr = {'GLY': 'G', 'ALA': 'A', 'VAL': 'V', 'LEU': 'L', 'ILE': 'I', 'PHE': 'F', 'TRP': 'W', 'TYR': 'Y', 'ASP': 'D', 'ASN': 'N', 'GLU': 'E', 'LYS': 'K', 'GLN': 'Q', 'MET': 'M', 'SER': 'S', 'THR': 'T', 'CYS': 'C', 'PRO': 'P', 'HIS': 'H', 'ARG': 'R', 'UNK': 'X'}
-thred = 15
+# M0 FIX (was 15). The released checkpoint behaves like the INFERENCE script,
+# which builds the interface graph at 6 A (ProAffinity-GNN_inference.py:431).
+# Training as shipped used 15 A, so the two paths produce different graphs from
+# the same complex and this script cannot reproduce the published model.
+thred = 6
 pdb_chain_tuple = get_chainlist_from_indexfile('data/index_example.txt')
 pdblist, chainlist = filter_data(pdb_chain_tuple, if_only_kd=False, if_2chain=False)
 
