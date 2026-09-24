@@ -92,13 +92,22 @@ def test_m1_gradients_reach_the_adapter():
     feats = torch.randn(3, PEPTIDE_FEATURE_DIM)
     mask = torch.ones(3, dtype=torch.bool)
 
-    enc(x, feats, mask).sum().backward()
+    # NOT .sum(): the adapter's output goes through LayerNorm, which makes every
+    # row zero-mean, so sum(LayerNorm(z)) = n*beta and is INDEPENDENT of z. A
+    # .sum() loss therefore has exactly zero gradient to the adapter by
+    # construction, and an earlier version of this test only passed on
+    # floating-point round-off -- it failed 4 runs in 6. Use a loss that
+    # actually depends on the output.
+    def loss(e):
+        return (e(x, feats, mask) ** 2).sum()
+
+    loss(enc).backward()
     assert enc.mlp[-1].weight.grad.abs().sum() > 0          # output layer learns immediately
     assert enc.mlp[0].weight.grad.abs().sum() == 0          # hidden layer waits one step
 
     opt = torch.optim.SGD(enc.parameters(), lr=0.1)
     opt.step(); opt.zero_grad()
-    enc(x, feats, mask).sum().backward()
+    loss(enc).backward()
     assert enc.mlp[0].weight.grad.abs().sum() > 0           # and then it learns
 
 
