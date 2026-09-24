@@ -119,24 +119,46 @@ class EsmEmbedder:
     the expensive part, so one instance is reused across a whole set."""
 
     def __init__(self, name="facebook/esm2_t33_650M_UR50D", device=None, cache_dir=None):
-        from transformers import AutoTokenizer, EsmModel
-        self.tok = AutoTokenizer.from_pretrained(name)
-        self.model = EsmModel.from_pretrained(name).eval()
+        # The 650M model is loaded LAZILY. Graph building parallelises across
+        # processes, and every worker eagerly loading 2.6 GB of weights costs
+        # more than the geometry it is there to compute. With the disk cache
+        # warmed first, workers never touch the model at all.
+        self.name = name
+        self.tok = None
+        self.model = None
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
         self.cache = {}
         self.cache_dir = Path(cache_dir) if cache_dir else None
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
+    def _ensure_model(self):
+        if self.model is not None:
+            return
+        from transformers import AutoTokenizer, EsmModel
+        self.tok = AutoTokenizer.from_pretrained(self.name)
+        self.model = EsmModel.from_pretrained(self.name).eval().to(self.device)
+
+    def warm(self, seqs):
+        """Embed and cache a set of sequences up front, so parallel workers can
+        run without ever loading the model."""
+        for s in dict.fromkeys(seqs):
+            self(s)
+
     @torch.no_grad()
     def __call__(self, seq: str) -> torch.Tensor:
         if seq in self.cache:
             return self.cache[seq]
-        fp = self.cache_dir / f"{abs(hash(seq)):016x}.pt" if self.cache_dir else None
+        # hashlib, NOT hash(): PYTHONHASHSEED is randomised per process, so
+        # hash() would give every worker a different filename for the same
+        # sequence and the cache would never hit across processes.
+        import hashlib
+        fp = (self.cache_dir / f"{hashlib.sha1(seq.encode()).hexdigest()}.pt"
+              if self.cache_dir else None)
         if fp is not None and fp.exists():
             emb = torch.load(fp, map_location="cpu")
         else:
+            self._ensure_model()
             enc = self.tok(seq, return_tensors="pt").to(self.device)
             emb = self.model(**enc).last_hidden_state.squeeze(0)[1:-1].cpu()
             if fp is not None:
