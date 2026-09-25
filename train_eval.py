@@ -70,10 +70,25 @@ def within_group(df):
     return float(np.mean(rs)) if rs else float("nan")
 
 
-def make_folds(items, key, k=5, seed=0):
-    """Grouped k-fold: every member of a group lands in the same fold."""
-    groups = sorted({it[key] for it in items})
+def make_folds(items, key, k=5, seed=0, within_group=False):
+    """Grouped k-fold: every member of a group lands in the same fold.
+
+    within_group=True instead splits INSIDE each group, so every group appears in
+    both training and test. That is the per-target setting -- the regime where
+    ECFP-16 beats the length baseline (+0.230 vs +0.199) while losing to it when
+    the target is unseen (+0.167). It is also the paper's "within-target"
+    partition. Scores are still reported per group, never pooled across targets.
+    """
     rng = np.random.default_rng(seed)
+    if within_group:
+        fold = np.empty(len(items), dtype=int)
+        by = {}
+        for i, it in enumerate(items):
+            by.setdefault(it[key], []).append(i)
+        for _, idx in by.items():
+            fold[np.array(idx)] = rng.permutation(len(idx)) % k
+        return fold
+    groups = sorted({it[key] for it in items})
     assign = {g: i for g, i in zip(rng.permutation(groups), np.arange(len(groups)) % k)}
     return np.array([assign[it[key]] for it in items])
 
@@ -152,7 +167,8 @@ def main():
     ap.add_argument("--index", default="/mnt/sda/tmp/ace_clean/index_src.csv")
     ap.add_argument("--clusters", default="/mnt/sda/home/tuanhai/peptides_exp/baselines/corpus/corpus.csv")
     ap.add_argument("--arms", default="M0,M1")
-    ap.add_argument("--split", default="cluster", choices=["cluster", "source"])
+    ap.add_argument("--split", default="cluster",
+                    choices=["cluster", "source", "within_group"])
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--lr", type=float, default=2e-4)
@@ -165,7 +181,7 @@ def main():
     a = ap.parse_args()
 
     items = load_graphs(a.graphs, a.index, a.clusters)
-    key = "cluster" if a.split == "cluster" else "source"
+    key = "cluster" if a.split == "cluster" else "source"   # within_group uses source too
     ys = np.array([it["y"] for it in items])
     print(f"{len(items)} graphs | split={a.split} "
           f"({len({it[key] for it in items})} groups) | "
@@ -175,7 +191,8 @@ def main():
     for arm in a.arms.split(","):
         per_seed = []
         for seed in range(a.seeds):
-            folds = make_folds(items, key, a.folds, seed)
+            folds = make_folds(items, key, a.folds, seed,
+                               within_group=(a.split == "within_group"))
             preds = []
             t0 = time.time()
             for f in range(a.folds):

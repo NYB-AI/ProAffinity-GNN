@@ -204,6 +204,37 @@ def pepaffinity_loss(pred, target, group_id=None, source_layer=None,
 
 # --------------------------------------------------------------- wrapped network
 
+class FingerprintHead(nn.Module):
+    """Whole-molecule fingerprint concatenated to the pooled graph vector.
+
+    ECFP is a property of the WHOLE peptide -- 2,048 substructure counts over the
+    SMILES -- so there is no meaningful mapping from a bit to a residue and it
+    cannot join the per-residue M1 features. It is attached where its scope
+    belongs: after the three towers pool to 3 x 64 = 192, alongside that vector,
+    which is also how the representation earned its result in the literature
+    (peptide and protein features concatenated, then regressed).
+
+    The projection is zero-initialised so a fresh model reproduces the backbone
+    head exactly, as with M1.
+    """
+
+    def __init__(self, in_dim: int = 2048, graph_dim: int = 192,
+                 hidden: int = 128, out_dim: int = 32, dropout: float = 0.1):
+        super().__init__()
+        self.fp = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden, out_dim),
+        )
+        nn.init.zeros_(self.fp[-1].weight)
+        nn.init.zeros_(self.fp[-1].bias)
+        self.norm = nn.LayerNorm(out_dim)
+
+    def forward(self, graph_head_out: torch.Tensor, fp: torch.Tensor) -> torch.Tensor:
+        """graph_head_out [B, out_dim] (the backbone's 32-d pre-activation);
+        fp [B, in_dim] log1p-scaled counts. Returns the summed 32-d vector."""
+        return graph_head_out + self.norm(self.fp(fp))
+
+
 class PepAffinityNet(nn.Module):
     """ProAffinity-GNN's three towers, plus M1 on the interface graph's peptide
     nodes and M2's source offset on the output. The GNN itself is untouched, so
@@ -211,18 +242,28 @@ class PepAffinityNet(nn.Module):
     missing."""
 
     def __init__(self, backbone: nn.Module, node_dim: int = 1280,
-                 n_sources: int = 0, use_m1: bool = True, use_m2: bool = True):
+                 n_sources: int = 0, use_m1: bool = True, use_m2: bool = True,
+                 fp_dim: int = 0):
         super().__init__()
         self.backbone = backbone
         self.pep_encoder = PeptideFeatureEncoder(node_dim) if use_m1 else None
         self.source = SourceOffset(n_sources) if (use_m2 and n_sources > 0) else None
+        self.fp_head = FingerprintHead(fp_dim) if fp_dim else None
 
-    def forward(self, inter_data, intra1, intra2, source_id=None):
+    def forward(self, inter_data, intra1, intra2, source_id=None, fp=None):
         if self.pep_encoder is not None and getattr(inter_data, "pep_mask", None) is not None:
             inter_data = inter_data.clone()
             inter_data.x = self.pep_encoder(inter_data.x, inter_data.pep_feats,
                                             inter_data.pep_mask.bool())
-        pred = self.backbone(inter_data, intra1, intra2)
+        if self.fp_head is None or fp is None:
+            pred = self.backbone(inter_data, intra1, intra2)
+        else:
+            # reach into the backbone so the fingerprint joins at the 32-d layer,
+            # leaving the three pretrained towers untouched
+            b = self.backbone
+            g = torch.cat([b.graph1(inter_data), b.graph2(intra1), b.graph3(intra2)], dim=1)
+            h = F.relu(b.fc1(g))
+            pred = b.fc2(self.fp_head(h, fp))
         if self.source is not None:
             pred = self.source(pred, source_id)
         return pred
