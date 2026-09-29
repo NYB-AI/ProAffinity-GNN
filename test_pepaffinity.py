@@ -225,3 +225,143 @@ def test_combined_loss_without_groups_or_source():
     out = pepaffinity_loss(torch.tensor([1.0, 2.0]), torch.tensor([1.0, 3.0]))
     assert out["rank"].item() == 0.0 and out["offset"].item() == 0.0
     assert out["total"].item() == pytest.approx(0.5)
+
+
+# --------------------------------------------------------------- Kabsch convention
+# A sign error here silently inflated every peptide RMSD reported on 28 Sep 2026 by
+# an amount that grew with the angle between the two frames, while leaving the
+# pocket residual correct -- so it looked self-consistent for a whole day.
+def test_kabsch_transfer_direction():
+    """R from svd(X^T Y) maps X -> Y, so moving a point from the Y frame into the
+    X frame requires R.T. Recover a known rigid transform and demand ~0 error."""
+    import numpy as np
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(200, 3)) * 10
+    pep = rng.normal(size=(9, 3)) * 3
+    ax = np.array([0.3, 0.5, 0.8]); ax /= np.linalg.norm(ax)
+    K = np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
+    th = 0.9
+    Rtrue = np.eye(3) + np.sin(th) * K + (1 - np.cos(th)) * K @ K
+    t = np.array([5.0, -3.0, 7.0])
+    Y, pep_moved = X @ Rtrue + t, pep @ Rtrue + t
+
+    ca, cb = X.mean(0), Y.mean(0)
+    U, S, Vh = np.linalg.svd((X - ca).T @ (Y - cb))
+    R = U @ np.diag([1, 1, np.sign(np.linalg.det(U @ Vh))]) @ Vh
+
+    good = (pep_moved - cb) @ R.T + ca
+    bad = (pep_moved - cb) @ R + ca
+    assert np.sqrt(((pep - good) ** 2).sum(1).mean()) < 1e-6, "R.T must recover the peptide"
+    assert np.sqrt(((pep - bad) ** 2).sum(1).mean()) > 1.0, "R must NOT recover it"
+
+
+def test_scorers_use_the_right_convention():
+    """Guard the three scripts that do this superposition, so the bug cannot
+    reappear by editing one of them."""
+    import pathlib
+    base = pathlib.Path("/mnt/sda/home/tuanhai/peptides_exp/baselines/scripts")
+    for name in ("pose_spread.py", "xtal_nearnative.py", "a0201_gate.py"):
+        f = base / name
+        if not f.exists():
+            continue
+        src = f.read_text()
+        assert "@ R.T + c" in src, f"{name} must transfer coordinates with R.T"
+
+
+# ------------------------------------------------------------------------ M3
+def test_m3_edge_features_shape_and_range():
+    import numpy as np
+    from pepaffinity_data import _edge_m3_vector, EDGE_M3_DIM
+    ra = {"type": "D", "names": ["N", "CA", "C", "O", "CB", "CG", "OD1", "OD2"],
+          "atoms": [("N", 0, 0, 0), ("C", 1.5, 0, 0), ("C", 2.4, 1.2, 0), ("OA", 2.0, 2.3, 0),
+                    ("C", 1.5, -1.0, 1.0), ("C", 2.0, -2.0, 1.5), ("OA", 3.0, -2.5, 1.0),
+                    ("OA", 1.5, -2.6, 2.4)]}
+    rb = {"type": "R", "names": ["N", "CA", "C", "O", "CB", "NE", "NH1"],
+          "atoms": [("N", 6, 0, 0), ("C", 5.0, 0, 0), ("C", 4.4, 1.2, 0), ("OA", 4.8, 2.3, 0),
+                    ("C", 4.5, -1.0, 1.0), ("NA", 3.8, -2.0, 1.4), ("NA", 3.2, -2.4, 2.0)]}
+    v = _edge_m3_vector(ra, rb)
+    assert v.shape == (EDGE_M3_DIM,)
+    assert np.isfinite(v).all()
+    assert (v >= -1.001).all() and (v <= 1.001).all(), "features must stay roughly unit-range"
+    assert v[16] == 1.0, "Asp/Arg within 4.5 A must register as a salt bridge"
+
+
+def test_m3_empty_residue_is_zero():
+    from pepaffinity_data import _edge_m3_vector, EDGE_M3_DIM
+    e = {"type": "G", "names": [], "atoms": []}
+    v = _edge_m3_vector(e, e)
+    assert v.shape == (EDGE_M3_DIM,) and not v.any()
+
+
+def test_m3_backbone_sidechain_uses_names_not_types():
+    """A backbone carbon and a side-chain carbon share the PDBQT type "C", so the
+    split has to come from atom names. Guards the bug this replaced."""
+    from pepaffinity_data import _bb_mask
+    r = {"type": "L", "names": ["N", "CA", "C", "O", "CB", "CG"],
+         "atoms": [("N",0,0,0),("C",1,0,0),("C",2,0,0),("OA",3,0,0),("C",1,1,0),("C",1,2,0)]}
+    m = _bb_mask(r)
+    assert m.tolist() == [True, True, True, True, False, False]
+
+
+def test_m3_is_identity_at_initialisation():
+    """A fresh M3 model must reproduce the backbone exactly, as M1 does."""
+    from pepaffinity import InterfaceEdgeEncoder
+    enc = InterfaceEdgeEncoder(edge_dim=280)
+    ea = torch.randn(17, 280)
+    m3 = torch.randn(17, 24)
+    out = enc(ea, m3)
+    assert torch.allclose(out, ea, atol=1e-6), "zero-init output must leave edge_attr unchanged"
+
+
+def test_m3_rejects_stale_graphs():
+    from pepaffinity import InterfaceEdgeEncoder
+    enc = InterfaceEdgeEncoder(edge_dim=280)
+    with pytest.raises(ValueError):
+        enc(torch.randn(10, 280), torch.randn(7, 24))
+
+
+def test_m3_metal_terms_fire():
+    """Zn2+ bridging a receptor and peptide residue must register. Guards against
+    shipping a feature that can only ever read zero -- which is what happened with
+    the H-bond term, whose polar hydrogens read_pdbqt was discarding."""
+    from pepaffinity_data import _edge_m3_vector, EDGE_M3_DIM
+    ra = {"type": "H", "names": ["N", "CA", "C", "O", "CB", "NE2"],
+          "atoms": [("N",0,0,0),("C",1.5,0,0),("C",2.4,1.2,0),("OA",2.0,2.3,0),
+                    ("C",1.5,-1.0,1.0),("NA",2.0,-2.0,1.5)]}
+    rb = {"type": "E", "names": ["N", "CA", "C", "O", "CB", "OE1"],
+          "atoms": [("N",6,0,0),("C",5.0,0,0),("C",4.4,1.2,0),("OA",4.8,2.3,0),
+                    ("C",4.5,-1.0,1.0),("OA",3.6,-2.2,1.6)]}
+    no_metal = _edge_m3_vector(ra, rb, ())
+    assert no_metal.shape == (EDGE_M3_DIM,)
+    assert no_metal[24] == 0.0 and no_metal[25] == 0.0
+    zn = [("ZN", 2.8, -2.1, 1.55)]                 # between the two coordinating atoms
+    with_metal = _edge_m3_vector(ra, rb, zn)
+    assert with_metal[24] > 0.5, "proximity term must respond to a nearby ion"
+    assert with_metal[25] == 1.0, "both residues within 3 A of one ion is a bridge"
+    far = _edge_m3_vector(ra, rb, [("ZN", 60.0, 60.0, 60.0)])
+    assert far[24] == 0.0 and far[25] == 0.0
+
+
+def test_m3_encoder_accepts_both_widths():
+    """The queued MHC job runs on 24-wide graphs; panelB will be rebuilt 26-wide."""
+    from pepaffinity import InterfaceEdgeEncoder
+    for w in (24, 26):
+        enc = InterfaceEdgeEncoder(edge_dim=280)
+        ea = torch.randn(11, 280)
+        out = enc(ea, torch.randn(11, w))
+        assert torch.allclose(out, ea, atol=1e-6)
+
+
+def test_read_metals_finds_ions():
+    import tempfile, os
+    from pepaffinity_data import read_metals
+    txt = ("ATOM      1  CA  ALA A   1      10.000  10.000  10.000  0.00  0.00    +0.000 C \n"
+           "HETATM 2000 ZN    ZN A 500       5.000   6.000   7.000  0.00  0.00    +2.000 Zn\n")
+    with tempfile.NamedTemporaryFile("w", suffix=".pdbqt", delete=False) as f:
+        f.write(txt); path = f.name
+    try:
+        m = read_metals(path)
+        assert len(m) == 1 and m[0][0] == "ZN"
+        assert m[0][1:] == (5.0, 6.0, 7.0)
+    finally:
+        os.unlink(path)

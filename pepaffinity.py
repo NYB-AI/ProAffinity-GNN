@@ -122,6 +122,52 @@ class PeptideFeatureEncoder(nn.Module):
         return out
 
 
+# --------------------------------------------------------------------------- M3
+
+EDGE_M3_DIM = 26
+
+
+class InterfaceEdgeEncoder(nn.Module):
+    """M3 (step 1). Projects the interaction descriptor to the edge width and ADDS it.
+
+    Additive rather than concatenated, for the same reason as M1: the pretrained
+    GATConv layers were trained with edge_dim=280, and widening the input would
+    discard those weights. The output is zero-initialised, so a fresh M3 model is
+    numerically identical to M0 and any later difference is learned.
+
+    What this adds over the existing 280-d edge vector -- a 28 atom-pair-type x 10
+    distance-bin histogram -- is the part that histogram cannot express: continuous
+    distance, which parts of each residue touch (backbone vs side chain, from atom
+    NAMES), rule-based interaction chemistry (salt bridge, hydrophobic, aromatic,
+    cation-pi, H-bond) which is not deducible from PDBQT atom types, and whether the
+    two side chains point at each other.
+    """
+
+    def __init__(self, edge_dim: int = 280, in_dim: int = EDGE_M3_DIM,
+                 hidden: int = 64, dropout: float = 0.0):
+        super().__init__()
+        # LazyLinear, so a graph set built before the metal terms existed (24-wide)
+        # and one built after (26-wide) both load. in_dim is kept only as
+        # documentation of the current builder's width.
+        self.mlp = nn.Sequential(
+            nn.LazyLinear(hidden), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden, edge_dim),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+        self.norm = nn.LayerNorm(edge_dim)
+
+    def forward(self, edge_attr: torch.Tensor, edge_m3: torch.Tensor) -> torch.Tensor:
+        if edge_m3 is None or edge_m3.numel() == 0 or edge_attr.numel() == 0:
+            return edge_attr
+        if edge_m3.shape[0] != edge_attr.shape[0]:
+            # a shape mismatch means the graph was built before M3 existed; failing
+            # loudly beats silently training an arm that is really M0
+            raise ValueError(f"edge_m3 has {edge_m3.shape[0]} rows, "
+                             f"edge_attr has {edge_attr.shape[0]} -- rebuild the graphs")
+        return edge_attr + self.norm(self.mlp(edge_m3))
+
+
 # --------------------------------------------------------------------------- M2
 
 class SourceOffset(nn.Module):
@@ -243,18 +289,27 @@ class PepAffinityNet(nn.Module):
 
     def __init__(self, backbone: nn.Module, node_dim: int = 1280,
                  n_sources: int = 0, use_m1: bool = True, use_m2: bool = True,
-                 fp_dim: int = 0):
+                 fp_dim: int = 0, use_m3: bool = False, edge_dim: int = 280):
         super().__init__()
         self.backbone = backbone
         self.pep_encoder = PeptideFeatureEncoder(node_dim) if use_m1 else None
         self.source = SourceOffset(n_sources) if (use_m2 and n_sources > 0) else None
         self.fp_head = FingerprintHead(fp_dim) if fp_dim else None
+        self.edge_encoder = InterfaceEdgeEncoder(edge_dim) if use_m3 else None
 
     def forward(self, inter_data, intra1, intra2, source_id=None, fp=None):
         if self.pep_encoder is not None and getattr(inter_data, "pep_mask", None) is not None:
             inter_data = inter_data.clone()
             inter_data.x = self.pep_encoder(inter_data.x, inter_data.pep_feats,
                                             inter_data.pep_mask.bool())
+        if self.edge_encoder is not None:
+            m3 = getattr(inter_data, "edge_m3", None)
+            if m3 is None:
+                raise ValueError("M3 arm needs edge_m3 on the interface graph -- "
+                                 "rebuild the graphs with the current builder")
+            if self.pep_encoder is None:
+                inter_data = inter_data.clone()
+            inter_data.edge_attr = self.edge_encoder(inter_data.edge_attr, m3)
         if self.fp_head is None or fp is None:
             pred = self.backbone(inter_data, intra1, intra2)
         else:
